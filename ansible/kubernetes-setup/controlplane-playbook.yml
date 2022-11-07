@@ -1,0 +1,236 @@
+---
+- hosts: all
+  become: true
+  tasks:
+  - name: Install packages that allow apt to be used over HTTPS
+    ansible.builtin.apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: true
+    vars:
+      packages:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+
+  - name: Configure Kubernetes Network
+    block:
+      - name: Add modules of kernel for K8S
+        ansible.builtin.blockinfile:
+          path: /etc/modules-load.d/crio.conf
+          block: |
+            overlay
+            br_netfilter
+          create: true
+          mode: 0644
+
+      - name: Ensure Network modules
+        community.general.modprobe:
+          name: "{{ item }}"
+          state: present
+        loop:
+          - overlay
+          - br_netfilter
+
+      - name: Configuration IPTables for CRI-O and K8S
+        ansible.builtin.blockinfile:
+          path: /etc/sysctl.d/99-kubernetes-cri.conf
+          block: |
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.ipv4.ip_forward                 = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+          create: true
+          mode: 0644
+        register: iptables
+
+      - name: Sysctl --system
+        ansible.builtin.command: sysctl --system
+        when: iptables is changed
+
+  - name: Install CRI-O
+    block:
+      - name: CRI-O apt key
+        ansible.builtin.apt_key:
+          url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/1.25/Debian_11/Release.key"
+          keyring: "/etc/apt/trusted.gpg.d/libcontainers.gpg"
+
+      - name: CRI-O repository
+        ansible.builtin.apt_repository:
+          repo: "{{ item.repo }}"
+          filename: "{{ item.filename }}"
+          state: present
+        loop:
+          - { repo: 'deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ crio_os_release }}/ /', filename: 'devel:kubic:libcontainers:stable.list' }
+          - { repo: 'deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ crio_version }}/{{ crio_os_release }}/ /', filename: 'devel:kubic:libcontainers:stable:cri-o:{{ crio_version }}.list'}
+
+      - name: Install CRI-O
+        ansible.builtin.apt:
+          name: "{{ packages }}"
+          state: present
+          update_cache: true
+        vars:
+          packages:
+            - cri-o
+            - cri-o-runc
+
+      - name: Start service CRI-O
+        ansible.builtin.service:
+          name: crio
+          daemon_reload: true
+          state: started
+          enabled: true
+
+  - name: Remove swapfile from /etc/fstab
+    ansible.posix.mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    loop:
+      - swap
+      - none
+
+  - name: Disable swap
+    ansible.builtin.command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Add an apt signing key for Kubernetes
+    ansible.builtin.apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Install Kubernetes
+    block:
+      - name: Adding apt repository for Kubernetes
+        ansible.builtin.apt_repository:
+          repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+          state: present
+          filename: kubernetes.list
+
+      - name: Install Kubernetes binaries
+        ansible.builtin.apt:
+          name: "{{ packages }}"
+          state: present
+          update_cache: true
+        vars:
+          packages:
+            - kubelet={{ kubernetes_release }}-00
+            - kubeadm={{ kubernetes_release }}-00
+            - kubectl={{ kubernetes_release }}-00
+
+      - name: Configure kubelet
+        ansible.builtin.lineinfile:
+          path: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+          line: Environment="KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}"
+
+      - name: Restart kubelet
+        ansible.builtin.service:
+          name: kubelet
+          daemon_reload: true
+          state: restarted
+
+      - name: Apt Hold kubernetes packages
+        ansible.builtin.dpkg_selections:
+          name: "{{ item }}"
+          selection: hold
+        loop:
+          - kubelet
+          - kubeadm
+          - kubectl
+          - crio
+          - cri-o-runc
+
+  - name: Kubeadm Cluster bootstrap
+    block:
+      - name: Create kubeadm config file
+        ansible.builtin.blockinfile:
+          path: /tmp/kubeadm-config.yml
+          block: |
+            apiVersion: kubeadm.k8s.io/v1beta3
+            kind: ClusterConfiguration
+            kubernetesVersion: {{ kubernetes_release }}
+            controlPlaneEndpoint: "{{ node_ip }}:6443"
+            networking:
+              dnsDomain: cluster.local
+              podSubnet: 10.11.0.0/16
+              serviceSubnet: 10.96.0.0/12
+            ---
+            apiVersion: kubelet.config.k8s.io/v1beta1
+            kind: KubeletConfiguration
+            cgroupDriver: systemd
+            serverTLSBootstrap: true
+            ---
+            apiVersion: kubeadm.k8s.io/v1beta3
+            kind: InitConfiguration
+            nodeRegistration:
+              criSocket: "unix:///var/run/crio/crio.sock"
+            localAPIEndpoint:
+              advertiseAddress: "{{ node_ip }}"
+          create: true
+          mode: 0644
+        register: kubeadm_config
+
+      - name: Kubeadm reset
+        ansible.builtin.command: kubeadm reset --force
+        when: kubeadm_config is changed
+
+      - name: Kubeadm Control Plane Images Pull
+        ansible.builtin.command: kubeadm config images pull
+        when: kubeadm_config is changed
+
+      - name: Kubeadm init
+        ansible.builtin.command: kubeadm init --config=/tmp/kubeadm-config.yml --upload-certs --skip-phases=addon/kube-proxy
+        when: kubeadm_config is changed
+
+      - name: Setup kubeconfig for vagrant user
+        ansible.builtin.command: "{{ item }}"
+        loop:
+          - mkdir -p /home/vagrant/.kube
+          - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+          - chown vagrant:vagrant /home/vagrant/.kube/config
+
+      - name: Install Kubernetes autocomplete
+        ansible.builtin.lineinfile:
+          path: ~/.bashrc
+          line: "{{ item }}"
+        loop:
+          - source <(kubectl completion bash)
+          - alias k=kubectl
+          - complete -o default -F __start_kubectl k
+        become_user: vagrant
+        become: false
+
+      - name: Kubelet certificates approve
+        ansible.builtin.shell: sleep 20s && kubectl get csr --no-headers | grep Pending |  awk '{print $1}' | tr '\n' ' ' | xargs kubectl certificate approve
+        become_user: vagrant
+        become: false
+
+  - name: Cilium install
+    block:
+      - name: Download cilium
+        ansible.builtin.unarchive:
+          src: https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
+          dest: /usr/local/bin
+          remote_src: yes
+        register: download_cilium
+
+      - name: Cilium install on Kubernetes
+        ansible.builtin.command: cilium install
+        become_user: vagrant
+        become: false
+        when: download_cilium is changed
+
+  - name: Generate Token Join for worker nodes
+    block:
+      - name: Generate join command
+        ansible.builtin.command: kubeadm token create --print-join-command
+        register: join_command
+
+      - name: Copy join command to local file
+        become: false
+        delegate_to: localhost
+        ansible.builtin.copy:
+          content: "{{ join_command.stdout_lines[0] }}"
+          dest: "./join-command"
+          mode: 0777

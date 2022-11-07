@@ -1,0 +1,8 @@
+---
+- hosts: all
+  become: true
+  tasks:
+  - name: Kubelet certificates approve
+    ansible.builtin.shell: kubectl get csr --no-headers | grep Pending |  awk '{print $1}' | tr '\n' ' ' | xargs kubectl certificate approve
+    become_user: vagrant
+    become: false
