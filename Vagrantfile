@@ -7,7 +7,7 @@ Vagrant.configure("2") do |config|
         v.memory = 4096
         v.cpus = 2
         v.customize ["modifyvm", :id, "--nicpromisc1", "allow-all", "--nicpromisc2", "allow-all"]
-        v.customize [ "guestproperty", "set", :id, "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold", 1000 ]        
+        v.customize [ "guestproperty", "set", :id, "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold", 1000 ]
     end
       
     config.vm.define "k8s-controlplane" do |controlplane|
@@ -44,7 +44,7 @@ Vagrant.configure("2") do |config|
             if i == N
                 node.vm.provision :ansible do |ansible|
                     ansible.limit = "k8s-controlplane"
-                    ansible.playbook = "ansible/kubernetes-setup/kubelet-certificates-approve.yml"
+                    ansible.playbook = "ansible/kubernetes-setup/kubernetes-addons.yml"
 
                 end
             end

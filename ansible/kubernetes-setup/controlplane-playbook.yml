@@ -154,7 +154,7 @@
             networking:
               dnsDomain: cluster.local
               podSubnet: 10.11.0.0/16
-              serviceSubnet: 10.96.0.0/12
+              serviceSubnet: 172.16.0.0/16 
             ---
             apiVersion: kubelet.config.k8s.io/v1beta1
             kind: KubeletConfiguration
@@ -216,7 +216,7 @@
         register: download_cilium
 
       - name: Cilium install on Kubernetes
-        ansible.builtin.command: cilium install
+        ansible.builtin.command: cilium install --config ipam=kubernetes
         become_user: vagrant
         become: false
         when: download_cilium is changed
